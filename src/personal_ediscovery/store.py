@@ -1,8 +1,13 @@
-"""SQLite-backed store for collections, documents, tombstones."""
+"""SQLite-backed store for collections, documents, tombstones.
+
+Optionally loads ``sqlite-vec`` for approximate-nearest-neighbour vector
+search when both the extension and the ``embedding`` module are available.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from datetime import datetime
@@ -10,10 +15,17 @@ from pathlib import Path
 from typing import Iterable
 from uuid import UUID
 
+import numpy as np
+
 from .models import Collection, Document
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DIR = Path.home() / ".personal-ediscovery"
 DB_NAME = "store.sqlite"
+
+# Dimension of the embedding vectors (must match the embedding model).
+EMBEDDING_DIM = 384
 
 
 def _sanitize_fts_query(query: str) -> str:
@@ -34,6 +46,20 @@ def _sanitize_fts_query(query: str) -> str:
     return " ".join(f'"{t}"' for t in tokens)
 
 
+def _try_load_sqlite_vec(db: sqlite3.Connection) -> bool:
+    """Attempt to load the sqlite-vec extension.  Returns True on success."""
+    try:
+        import sqlite_vec  # type: ignore[import-untyped]
+
+        db.enable_load_extension(True)
+        sqlite_vec.load(db)
+        db.enable_load_extension(False)
+        return True
+    except Exception:
+        logger.debug("sqlite-vec not available — vector search disabled.", exc_info=True)
+        return False
+
+
 class Store:
     def __init__(self, root: Path | None = None) -> None:
         # Resolve lazily so monkeypatching `store.DEFAULT_DIR` in tests works.
@@ -41,7 +67,12 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.root / DB_NAME)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self._vec_enabled = _try_load_sqlite_vec(self.db)
         self._init_schema()
+
+    @property
+    def vec_enabled(self) -> bool:
+        return self._vec_enabled
 
     def _init_schema(self) -> None:
         cur = self.db.cursor()
@@ -82,6 +113,25 @@ class Store:
         """)
         self.db.commit()
 
+        if self._vec_enabled:
+            self._init_vec_schema()
+
+    def _init_vec_schema(self) -> None:
+        """Create the vec0 virtual table for vector search."""
+        try:
+            self.db.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents "
+                f"USING vec0(id TEXT PRIMARY KEY, embedding float[{EMBEDDING_DIM}])"
+            )
+            self.db.commit()
+        except Exception:
+            logger.warning("Failed to create vec_documents table.", exc_info=True)
+            self._vec_enabled = False
+
+    # ------------------------------------------------------------------
+    # Collections
+    # ------------------------------------------------------------------
+
     def create_collection(self, name: str, root: str, adapter: str) -> Collection:
         col = Collection(name=name, root=root, adapter=adapter, consent_token=secrets.token_urlsafe(16))
         self.db.execute(
@@ -116,9 +166,29 @@ class Store:
             created_at=datetime.fromisoformat(row[3]), consent_token=row[4],
         )
 
-    def add_documents(self, collection: str, items: Iterable[Document]) -> int:
+    def delete_collection(self, name: str) -> bool:
+        """Remove a collection and all its documents (no tombstones)."""
+        col = self.get_collection(name)
+        if not col:
+            return False
+        self.clear_collection(name)
+        self.db.execute("DELETE FROM collections WHERE name = ?", (name,))
+        self.db.commit()
+        return True
+
+    # ------------------------------------------------------------------
+    # Documents
+    # ------------------------------------------------------------------
+
+    def add_documents(
+        self,
+        collection: str,
+        items: Iterable[Document],
+        embeddings: np.ndarray | None = None,
+    ) -> int:
+        docs_list = list(items)
         n = 0
-        for d in items:
+        for idx, d in enumerate(docs_list):
             self.db.execute(
                 "INSERT INTO documents(id, collection, source_ref, title, modified_at, body, meta_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -131,6 +201,13 @@ class Store:
                     json.dumps(d.meta),
                 ),
             )
+            # Insert embedding if available
+            if self._vec_enabled and embeddings is not None and idx < len(embeddings):
+                vec_bytes = embeddings[idx].astype(np.float32).tobytes()
+                self.db.execute(
+                    "INSERT INTO vec_documents(id, embedding) VALUES (?, ?)",
+                    (str(d.id), vec_bytes),
+                )
             n += 1
         self.db.commit()
         return n
@@ -146,12 +223,18 @@ class Store:
         ids = [r[0] for r in rows]
         for did in ids:
             self.db.execute("DELETE FROM documents WHERE id = ?", (did,))
+            if self._vec_enabled:
+                self.db.execute("DELETE FROM vec_documents WHERE id = ?", (did,))
         self.db.commit()
         return len(ids)
 
     def count_documents(self, collection: str) -> int:
         row = self.db.execute("SELECT count(*) FROM documents WHERE collection = ?", (collection,)).fetchone()
         return int(row[0]) if row else 0
+
+    # ------------------------------------------------------------------
+    # Search — BM25
+    # ------------------------------------------------------------------
 
     def search_bm25(self, query: str, collection: str | None, k: int = 10) -> list[tuple[Document, float]]:
         sql = (
@@ -180,6 +263,59 @@ class Store:
             out.append((d, float(r[7])))
         return out
 
+    # ------------------------------------------------------------------
+    # Search — Vector (sqlite-vec)
+    # ------------------------------------------------------------------
+
+    def search_vector(
+        self,
+        query_embedding: np.ndarray,
+        collection: str | None,
+        k: int = 10,
+    ) -> list[tuple[Document, float]]:
+        """Perform ANN search using sqlite-vec.  Returns empty if vec disabled."""
+        if not self._vec_enabled:
+            return []
+
+        vec_bytes = query_embedding.astype(np.float32).tobytes()
+
+        # sqlite-vec returns (id, distance); lower distance = more similar.
+        # We fetch more than k to allow post-filtering by collection.
+        fetch_k = k * 3 if collection else k
+        rows = self.db.execute(
+            "SELECT id, distance FROM vec_documents WHERE embedding MATCH ? AND k = ?",
+            (vec_bytes, fetch_k),
+        ).fetchall()
+
+        out: list[tuple[Document, float]] = []
+        for doc_id, distance in rows:
+            doc_row = self.db.execute(
+                "SELECT id, collection, source_ref, title, modified_at, body, meta_json "
+                "FROM documents WHERE id = ?",
+                (doc_id,),
+            ).fetchone()
+            if not doc_row:
+                continue
+            if collection and doc_row[1] != collection:
+                continue
+            d = Document(
+                id=UUID(doc_row[0]),
+                collection=doc_row[1],
+                source_ref=doc_row[2],
+                title=doc_row[3],
+                modified_at=datetime.fromisoformat(doc_row[4]) if doc_row[4] else None,
+                body=doc_row[5],
+                meta=json.loads(doc_row[6]) if doc_row[6] else {},
+            )
+            out.append((d, float(distance)))
+            if len(out) >= k:
+                break
+        return out
+
+    # ------------------------------------------------------------------
+    # Forget
+    # ------------------------------------------------------------------
+
     def forget(self, collection: str, query: str) -> int:
         rows = self.db.execute(
             "SELECT id FROM documents WHERE collection = ? AND body LIKE ?",
@@ -188,6 +324,8 @@ class Store:
         ids = [r[0] for r in rows]
         for did in ids:
             self.db.execute("DELETE FROM documents WHERE id = ?", (did,))
+            if self._vec_enabled:
+                self.db.execute("DELETE FROM vec_documents WHERE id = ?", (did,))
             self.db.execute(
                 "INSERT INTO tombstones(id, collection, removed_at, query) VALUES (?, ?, ?, ?)",
                 (did, collection, datetime.now().isoformat(), query),

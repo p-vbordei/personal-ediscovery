@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import typer
+import uvicorn
 
 from .services import index_collection, search
 from .store import Store
@@ -78,30 +79,19 @@ def forget(
 
 @app.command(name="mcp-stdio")
 def mcp_stdio() -> None:
-    """Stub MCP-over-stdio process.
+    """Run the real MCP-over-stdio process using FastMCP."""
+    from .mcp_server import mcp
+    mcp.run()
 
-    The real MCP wiring lives in v0.2 with the official Python SDK.
-    For now, this prints the contract so an agent can see what the
-    server would expose.
-    """
-    contract = {
-        "spec": "mcp-provenance/0.1",
-        "name": "@personal-ediscovery/server",
-        "version": "0.1.0",
-        "capabilities": {
-            "tools": [
-                "ediscovery.list_collections",
-                "ediscovery.search",
-                "ediscovery.forget",
-            ],
-            "network": {"egress": [], "noEgress": True},
-            "filesystem": {"read": ["~/.personal-ediscovery"], "write": ["~/.personal-ediscovery"], "tempOnly": False},
-            "env": {"required": [], "optional": []},
-            "executesArbitraryCode": False,
-            "userApprovalRequiredFor": ["ediscovery.forget"],
-        },
-    }
-    typer.echo(json.dumps(contract, indent=2))
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+) -> None:
+    """Run the FastAPI server and Web UI."""
+    typer.echo(f"Starting server at http://{host}:{port}")
+    uvicorn.run("personal_ediscovery.server:app", host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

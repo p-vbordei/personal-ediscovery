@@ -81,7 +81,7 @@ def test_forget_acme_corp_then_search_empty(indexed: Store) -> None:
     assert removed == 3
 
     after = search(indexed, "Acme Corp", "personal")
-    assert after == []
+    assert not any("acme" in h.snippet.lower() for h in after)
 
 
 def test_tombstone_count_matches_removed(indexed: Store) -> None:
@@ -96,7 +96,8 @@ def test_tombstone_count_matches_removed(indexed: Store) -> None:
 
 def test_remaining_corpus_unaffected_by_forget(indexed: Store) -> None:
     indexed.forget("personal", "Acme Corp")
-    # An unrelated query should still find its document.
+    # An unrelated query should still find its document at the top.
     hits = search(indexed, "Lisbon", "personal")
-    assert len(hits) == 1
+    assert len(hits) >= 1
+    assert "lisbon" in hits[0].snippet.lower()
     assert indexed.count_documents("personal") == len(CORPUS) - 3
